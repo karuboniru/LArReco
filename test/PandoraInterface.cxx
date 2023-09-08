@@ -8,6 +8,8 @@
 
 #include "Api/PandoraApi.h"
 #include "Helpers/XmlHelper.h"
+#include "Managers/PluginManager.h"
+#include "TLorentzVector.h"
 #include "Xml/tinyxml.h"
 
 #include "larpandoracontent/LArContent.h"
@@ -17,6 +19,9 @@
 #include "larpandoracontent/LArPersistency/EventReadingAlgorithm.h"
 #include "larpandoracontent/LArPlugins/LArPseudoLayerPlugin.h"
 #include "larpandoracontent/LArPlugins/LArRotationalTransformationPlugin.h"
+#include "Pandora/ObjectCreation.h"
+#include "Objects/MCParticle.h"
+#include <cstddef>
 
 #ifdef LIBTORCH_DL
 #include "larpandoradlcontent/LArDLContent.h"
@@ -31,6 +36,9 @@
 #include <getopt.h>
 #include <iostream>
 #include <string>
+
+#include "chain_helper.h"
+#include "TGraph2D.h"
 
 using namespace pandora;
 using namespace lar_reco;
@@ -106,17 +114,176 @@ void CreatePandoraInstances(const Parameters &parameters, const Pandora *&pPrima
 
 //------------------------------------------------------------------------------------------------------------------------------------------
 
-void ProcessEvents(const Parameters &parameters, const Pandora *const pPrimaryPandora)
-{
+class JUNOEvent {
+  public:
+    static JUNOEvent &instance() {
+        static JUNOEvent m_instance{
+            "/var/home/yan/code/rdf_framework_juno/build/process.root"};
+        return m_instance;
+    }
+    decltype(auto) operator[](std::size_t id) {
+        std::cerr << "id: " << id << std::endl;
+        return junoEDMfile.get_elements(id - 1);
+    }
+    size_t size() { return junoEDMfile.get_entries(); }
+
+  private:
+    JUNOEvent(std::string path)
+        : junoEDMfile(
+              std::vector<std::string>{path}, "treeout",
+              {"plotnpe", "plothittime", "initpoint", "exitpoint", "initP"}) {}
+    root_chain<TGraph2D, TGraph2D, TLorentzVector, TLorentzVector,
+               TLorentzVector>
+        junoEDMfile;
+};
+
+// class junoTrackP : public object_creation::MCParticle::Parameters{
+// public:
+//     int PDG{};
+//     double start_theta{};
+//     double start_phi{};
+//     double start_t{};
+//     double end_theta{};
+//     double end_phi{};
+//     double end_t{};
+// };
+
+class JUNOparticle : public pandora::MCParticle{
+    public:
+    JUNOparticle (const object_creation::MCParticle::Parameters &parameters) : pandora::MCParticle(parameters) {}
+};
+
+class junoTrackF
+    : public pandora::ObjectFactory<object_creation::MCParticle::Parameters,
+                                    object_creation::MCParticle::Object> {
+  public:
+    virtual Parameters *NewParameters() const { return new Parameters; }
+    virtual StatusCode Read(Parameters &, FileReader &) const {
+        return pandora::STATUS_CODE_SUCCESS;
+    }
+    virtual StatusCode Write(const Object *const, FileWriter &) const {
+        return pandora::STATUS_CODE_SUCCESS;
+    }
+
+  private:
+    virtual StatusCode Create(const Parameters &parameters,
+                              const Object *&pObject) const {
+        pObject = new JUNOparticle(parameters);
+        return pandora::STATUS_CODE_SUCCESS;
+    }
+};
+
+void InitializeTrack(const TLorentzVector &start, const TLorentzVector &end,
+                     const TLorentzVector &p,
+                     const Pandora *const pPrimaryPandora) {
+    object_creation::MCParticle::Parameters parameters;
+    parameters.m_energy = p.E();
+    parameters.m_momentum.Set({(float)p.Px(), (float)p.Py(), (float)p.Pz()});
+    parameters.m_vertex.Set(
+        {(float)start.T(), (float)start.Theta(), (float)start.Phi()});
+    parameters.m_endpoint.Set(
+        {(float)end.T(), (float)end.Theta(), (float)end.Phi()});
+    parameters.m_particleId = 13;
+    parameters.m_mcParticleType = pandora::MC_VIEW_W;
+    parameters.m_pParentAddress = nullptr;
+    try {
+        PANDORA_THROW_RESULT_IF(
+            pandora::STATUS_CODE_SUCCESS, !=,
+            PandoraApi::MCParticle::Create(*pPrimaryPandora, parameters,
+                                           junoTrackF{}));
+    } catch (const pandora::StatusCodeException &) {
+        std::cerr
+            << "CreatePandoraMCParticles - unable to create mc "
+               "neutrino, insufficient or invalid information supplied "
+            << std::endl;
+    }
+}
+
+class JUNOHit : public pandora::CaloHit {
+  public:
+    JUNOHit(const object_creation::CaloHit::Parameters &parameters)
+        : pandora::CaloHit(parameters) {}
+};
+
+class JUNOCarloHitF
+    : public pandora::ObjectFactory<object_creation::CaloHit::Parameters,
+                                    object_creation::CaloHit::Object> {
+  public:
+    virtual Parameters *NewParameters() const { return new Parameters; }
+    virtual StatusCode Read(Parameters &, FileReader &) const {
+        return pandora::STATUS_CODE_SUCCESS;
+    }
+    virtual StatusCode Write(const Object *const, FileWriter &) const {
+        return pandora::STATUS_CODE_SUCCESS;
+    }
+
+  protected:
+    virtual StatusCode Create(const Parameters &parameters,
+                              const Object *&pObject) const {
+        pObject = new JUNOHit(parameters);
+        return pandora::STATUS_CODE_SUCCESS;
+    }
+};
+
+void InitializeCarlo(double t, double charge, double theta, double phi, const Pandora *const pPandora){
+    object_creation::CaloHit::Parameters caloHitParameters;
+    caloHitParameters.m_cellSize0 = 1;
+    caloHitParameters.m_cellSize1 = 1;
+    caloHitParameters.m_cellThickness = 0.5;
+    caloHitParameters.m_cellGeometry = pandora::RECTANGULAR;
+    caloHitParameters.m_time = 0.;
+    caloHitParameters.m_nCellRadiationLengths = 1;
+    caloHitParameters.m_nCellInteractionLengths = 1;
+    caloHitParameters.m_isDigital = false;
+    caloHitParameters.m_hitRegion = pandora::SINGLE_REGION;
+    caloHitParameters.m_layer = 0;
+    caloHitParameters.m_isInOuterSamplingLayer = false;
+    caloHitParameters.m_inputEnergy = charge;
+    caloHitParameters.m_mipEquivalentEnergy = 1;
+    caloHitParameters.m_electromagneticEnergy = 1;
+    caloHitParameters.m_hadronicEnergy = 1;
+    caloHitParameters.m_hitType = pandora::TPC_VIEW_W;
+    const double wpos_cm(
+            pPandora->GetPlugins()->GetLArTransformationPlugin()->YZtoW(theta, phi));
+    caloHitParameters.m_positionVector.Set(pandora::CartesianVector(t, 0, wpos_cm));
+    caloHitParameters.m_expectedDirection.Set(pandora::CartesianVector(0, 0, 1));
+    caloHitParameters.m_cellNormalVector.Set(pandora::CartesianVector(0, 0, 1));
+    caloHitParameters.m_pParentAddress = nullptr;
+    
+    // caloHitParameters.m_positionVector = pandora::CartesianVector(t, 0, theta - phi);
+    try {
+        PANDORA_THROW_RESULT_IF(pandora::STATUS_CODE_SUCCESS, !=,
+                                PandoraApi::CaloHit::Create(*pPandora,
+                                                            caloHitParameters,
+                                                            JUNOCarloHitF{}));
+    } catch (const pandora::StatusCodeException &) {
+        return;
+    }
+}
+
+void ProcessEvents(const Parameters &parameters,
+                   const Pandora *const pPrimaryPandora) {
     int nEvents(0);
 
-    while ((nEvents++ < parameters.m_nEventsToProcess) || (0 > parameters.m_nEventsToProcess))
-    {
+    while ((nEvents++ < parameters.m_nEventsToProcess) ||
+           (0 > parameters.m_nEventsToProcess)) {
         if (parameters.m_shouldDisplayEventNumber)
-            std::cout << std::endl << "   PROCESSING EVENT: " << (nEvents - 1) << std::endl << std::endl;
-
-        PANDORA_THROW_RESULT_IF(STATUS_CODE_SUCCESS, !=, PandoraApi::ProcessEvent(*pPrimaryPandora));
-        PANDORA_THROW_RESULT_IF(STATUS_CODE_SUCCESS, !=, PandoraApi::Reset(*pPrimaryPandora));
+            std::cout << std::endl
+                      << "   PROCESSING EVENT: " << (nEvents - 1) << std::endl
+                      << std::endl;
+        auto &&[plotnpe, plothittime, initpoint, exitpoint, initP] =
+            JUNOEvent::instance()[nEvents];
+        InitializeTrack(initpoint, exitpoint, initP, pPrimaryPandora);
+        auto nhit = plotnpe.GetN();
+        for (int i = 0; i < nhit; ++i) {
+            InitializeCarlo(plothittime.GetZ()[i], plotnpe.GetZ()[i],
+                            plotnpe.GetX()[i], plotnpe.GetY()[i],
+                            pPrimaryPandora);
+        }
+        PANDORA_THROW_RESULT_IF(STATUS_CODE_SUCCESS, !=,
+                                PandoraApi::ProcessEvent(*pPrimaryPandora));
+        PANDORA_THROW_RESULT_IF(STATUS_CODE_SUCCESS, !=,
+                                PandoraApi::Reset(*pPrimaryPandora));
     }
 }
 
@@ -163,7 +330,7 @@ bool ParseCommandLine(int argc, char *argv[], Parameters &parameters)
                 return PrintOptions();
         }
     }
-
+    parameters.m_nEventsToProcess = JUNOEvent::instance().size();
     return ProcessRecoOption(recoOption, parameters);
 }
 
